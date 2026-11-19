@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#FFFBF2" />
+    <meta name="description" content="企鹅小窝 · 给两个人的本地回忆记录" />
+    <title>企鹅小窝</title>
+    <link rel="manifest" href="./manifest.json" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-title" content="企鹅小窝" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <link rel="apple-touch-icon" href="./images/icon-192.png" />
+    <link rel="icon" type="image/png" href="./images/icon-192.png" />
+    <link rel="stylesheet" href="./styles.css" />
+    <!-- Supabase JS SDK：必须放在 app.js（type="module"，天然 defer）之前，
+         这样 lib/supabaseClient.js 读 window.supabase 时已经就绪。 -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  </head>
+  <body>
+    <main class="app">
+      <header class="app-header">
+        <h1>企鹅小窝</h1>
+        <button id="settings-btn" class="btn btn-text" type="button">设置</button>
+      </header>
+      <div class="days-banner" hidden>
+        <p id="together-days" class="together-days">设置纪念日</p>
+      </div>
+      <div id="view" class="view"></div>
+    </main>
+    <nav class="bottom-nav" aria-label="主要操作">
+      <button id="new-entry-btn" class="nav-btn" type="button">＋ 记一笔</button>
+      <button id="random-btn" class="nav-btn" type="button">随机回顾</button>
+    </nav>
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
