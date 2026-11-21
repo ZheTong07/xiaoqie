@@ -12,6 +12,11 @@ import {
   importEntries,
 } from "./data/repository.js";
 import {
+  listNotes,
+  createNote,
+  deleteNote,
+} from "./data/notesRepository.js";
+import {
   saveMedia,
   deleteMany,
   exportAllMedia,
@@ -25,6 +30,7 @@ import {
   renderTimeline,
   renderEntryForm,
   renderSettingsView,
+  renderNotesView,
   openEntryPreview,
   formHasUnsavedChanges,
   animateOut,
@@ -34,6 +40,7 @@ import {
 const viewEl = document.getElementById("view");
 const newBtn = document.getElementById("new-entry-btn");
 const randomBtn = document.getElementById("random-btn");
+const notesBtn = document.getElementById("notes-btn");
 const settingsBtn = document.getElementById("settings-btn");
 const daysEl = document.getElementById("together-days");
 const titleEl = document.querySelector(".app-header h1");
@@ -52,9 +59,12 @@ let formOpen = false;
 let formSaving = false;
 /** 设置视图是否已打开。 */
 let settingsOpen = false;
+/** 小纸条视图是否已打开（同一按钮再点一次返回时间线）。 */
+let notesOpen = false;
 
 newBtn.addEventListener("click", () => showForm());
 randomBtn.addEventListener("click", showRandomReview);
+notesBtn?.addEventListener("click", () => showNotes());
 settingsBtn.addEventListener("click", showSettingsView);
 
 function disposeCurrentView() {
@@ -86,31 +96,52 @@ async function showList() {
   editingEntry = null;
   formOpen = false;
   settingsOpen = false;
+  notesOpen = false;
+  notesBtn?.setAttribute("aria-pressed", "false");
 
+  // 只有「记录本身读不出来」才允许整页报错；媒体失败一律降级处理。
+  let entries;
   try {
-    const entries = await listEntries();
-    const view = await renderTimeline(entries, {
-      onEdit: (entry) => showForm(entry),
-      onDelete: handleDelete,
-    });
-
-    if (token !== renderToken) {
-      // 渲染期间用户已切走，丢弃这次结果
-      view.dispose();
-      return;
-    }
-
-    disposeCurrentView();
-    viewEl.replaceChildren(view.element);
-    currentView = view;
-
-    // 视图切换完成后再恢复全局按钮，避免设置页 / 表单页出现闪烁
-    if (settingsBtn) settingsBtn.hidden = false;
-    if (bottomNav) bottomNav.hidden = false;
+    entries = await listEntries();
   } catch (err) {
     if (token !== renderToken) return;
     showFatal(err);
+    return;
   }
+
+  if (token !== renderToken) return;
+
+  let view;
+  try {
+    // 同步渲染文字，媒体只留占位；不再等媒体请求。
+    view = renderTimeline(entries, {
+      onEdit: (entry) => showForm(entry),
+      onDelete: handleDelete,
+    });
+  } catch (err) {
+    console.error("渲染时间线失败", err);
+    showToast("页面渲染失败，请刷新后重试");
+    return;
+  }
+
+  if (token !== renderToken) {
+    // 渲染期间用户已切走，丢弃这次结果
+    view.dispose();
+    return;
+  }
+
+  disposeCurrentView();
+  viewEl.replaceChildren(view.element);
+  currentView = view;
+
+  // 视图切换完成后再恢复全局按钮，避免设置页 / 表单页出现闪烁
+  if (settingsBtn) settingsBtn.hidden = false;
+  if (bottomNav) bottomNav.hidden = false;
+
+  // 文字已经上屏，媒体在后台逐个加载；失败只影响对应占位块。
+  Promise.resolve(view.loadMedia?.()).catch((err) => {
+    console.warn("媒体后台加载失败", err);
+  });
 }
 
 function showForm(entry = null) {
@@ -129,6 +160,8 @@ function showForm(entry = null) {
   formOpen = true;
   formSaving = false;
   settingsOpen = false;
+  notesOpen = false;
+  notesBtn?.setAttribute("aria-pressed", "false");
   renderToken += 1;
   disposeCurrentView();
   if (settingsBtn) settingsBtn.hidden = true;
@@ -201,6 +234,8 @@ function showSettingsView() {
   if (settingsOpen || formOpen) return;
 
   settingsOpen = true;
+  notesOpen = false;
+  notesBtn?.setAttribute("aria-pressed", "false");
   renderToken += 1;
   disposeCurrentView();
   if (settingsBtn) settingsBtn.hidden = true;
@@ -224,6 +259,62 @@ function showSettingsView() {
 function exitSettingsView() {
   settingsOpen = false;
   showList();
+}
+
+// ---------- 悄悄话小纸条 ----------
+
+async function showNotes() {
+  // 正在编辑且有未保存内容：先确认，避免点一下标签页就丢草稿
+  if (formOpen) {
+    if (formSaving) return;
+    if (formHasUnsavedChanges()) {
+      const confirmed = window.confirm("有未保存的修改，确定要离开吗？");
+      if (!confirmed) return;
+    }
+    formOpen = false;
+  }
+
+  // 再点一次「小纸条」回到时间线（当作 Tab 切换）
+  if (notesOpen) {
+    showList();
+    return;
+  }
+
+  const token = ++renderToken;
+  notesOpen = true;
+  settingsOpen = false;
+  editingEntry = null;
+  disposeCurrentView();
+
+  notesBtn?.setAttribute("aria-pressed", "true");
+  if (settingsBtn) settingsBtn.hidden = false;
+  if (bottomNav) bottomNav.hidden = false;
+
+  const view = renderNotesView({
+    onSend: (text) => createNote(text),
+    onDelete: async (note) => {
+      const confirmed = window.confirm("删除这张小纸条？删除后不可恢复");
+      if (!confirmed) return false;
+
+      await deleteNote(note.id);
+      showToast("已删除");
+      return true;
+    },
+  });
+
+  viewEl.replaceChildren(view.element);
+  currentView = { dispose: () => view.dispose?.() };
+
+  try {
+    const notes = await listNotes();
+    if (token !== renderToken) return;
+    view.setNotes(notes);
+  } catch (err) {
+    if (token !== renderToken) return;
+    console.error(err);
+    view.setNotes([]);
+    view.setError(err?.message || "读取小纸条失败");
+  }
 }
 
 async function handleDelete(entry) {
@@ -369,6 +460,8 @@ function showFatal(err) {
   console.error(err);
   formOpen = false;
   settingsOpen = false;
+  notesOpen = false;
+  notesBtn?.setAttribute("aria-pressed", "false");
   if (settingsBtn) settingsBtn.hidden = false;
   if (bottomNav) bottomNav.hidden = false;
   disposeCurrentView();
@@ -381,7 +474,7 @@ function showFatal(err) {
 
   const hint = document.createElement("p");
   hint.textContent =
-    "数据现在来自云端：请检查网络能否访问 Supabase，并确认已在 SQL Editor 执行 supabase/schema.sql。" +
+    "数据现在来自云端：请检查网络后重试；若一直失败，确认 Supabase 项目可用，并已在 SQL Editor 执行 supabase/schema.sql。" +
     (err?.message ? `（${err.message}）` : "");
 
   box.append(title, hint);

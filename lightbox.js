@@ -1,8 +1,8 @@
 /**
  * 全屏灯箱：查看图片 / 视频。
  *
- * 灯箱自己创建并释放 objectURL，不复用列表缩略图的 URL ——
- * 关闭或切换时 revoke 只影响灯箱自己，列表图不会裂。
+ * 媒体地址从 mediaStore 取（云端公开 URL），关闭 / 切换时调用 revokeMediaURL
+ * 统一走同一套释放逻辑；云端 URL 上是空操作，未来回落成本地 blob 时无需改这里。
  */
 
 import { getMediaURL, revokeMediaURL } from "./storage/mediaStore.js";

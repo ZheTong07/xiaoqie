@@ -18,6 +18,7 @@ import {
   CLOUD_SCOPE,
   TABLES,
   getClient,
+  getStoragePublicURL,
   toAppError,
   toMillis,
 } from "../lib/supabaseClient.js";
@@ -43,12 +44,38 @@ function fromRow(row) {
     size: Number(row.size) || 0,
     fileName: row.file_name ?? "",
 
-    /** 桶内路径，删除对象时用；getPublicUrl 拼出的公开地址存在 url 列。 */
+    /** 桶内路径，删除对象时用；对外 url 一律由它现拼，不信任 url 列。 */
     storagePath: row.storage_path ?? "",
-    url: row.url ?? "",
+    url: resolveMediaURL(row),
 
     createdAt: toMillis(row.created_at),
   };
+}
+
+/**
+ * 从历史 url 里反解桶内路径。
+ * 反代上线前写入的 url 是直连 supabase.co 的，现拼时仍要走同源 /api。
+ */
+function storagePathFromURL(url) {
+  const match = /\/storage\/v1\/object\/public\/[^/]+\/([^?#]+)/.exec(
+    String(url ?? ""),
+  );
+  if (!match) return "";
+
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return match[1];
+  }
+}
+
+/**
+ * 媒体的可访问地址：优先用 storage_path 现拼，缺路径时才回退历史 url。
+ * 这样数据库里已有的记录无需迁移即可走反代。
+ */
+function resolveMediaURL(row) {
+  const path = row.storage_path || storagePathFromURL(row.url);
+  return path ? getStoragePublicURL(path) : String(row.url ?? "");
 }
 
 function toRow(record) {
@@ -183,10 +210,11 @@ export async function getMediaBlob(id) {
     if (!downloadError && blob) return blob;
   }
 
-  if (!row.url) return null;
+  const url = resolveMediaURL(row);
+  if (!url) return null;
 
   try {
-    const response = await fetch(row.url);
+    const response = await fetch(url);
     return response.ok ? await response.blob() : null;
   } catch {
     return null;
@@ -203,13 +231,15 @@ export async function getMediaURL(id) {
   const supabase = getClient();
   const { data, error } = await supabase
     .from(TABLE)
-    .select("url")
+    .select("storage_path, url")
     .eq("id", id)
     .maybeSingle();
 
   if (error) throw toAppError(error, "读取媒体失败");
-  if (!data?.url) throw new Error("媒体不存在或已被删除");
-  return data.url;
+
+  const url = data ? resolveMediaURL(data) : "";
+  if (!url) throw new Error("媒体不存在或已被删除");
+  return url;
 }
 
 /**
@@ -228,7 +258,7 @@ export async function getMediaURLs(ids) {
   const supabase = getClient();
   const { data, error } = await supabase
     .from(TABLE)
-    .select("id, kind, mime_type, url")
+    .select("id, kind, mime_type, storage_path, url")
     .in("id", list);
 
   if (error) throw toAppError(error, "读取媒体失败");
@@ -237,12 +267,16 @@ export async function getMediaURLs(ids) {
   const views = [];
   for (const id of list) {
     const row = byId.get(id);
-    if (!row?.url) continue;
+    if (!row) continue;
+
+    const url = resolveMediaURL(row);
+    if (!url) continue;
+
     views.push({
       id: row.id,
       kind: row.kind,
       mimeType: row.mime_type,
-      url: row.url,
+      url,
     });
   }
   return views;
@@ -415,14 +449,16 @@ export async function importMedia(records) {
 async function uploadBlob(supabase, path, blob, contentType, { upsert = false } = {}) {
   const { error } = await supabase.storage.from(BUCKET).upload(path, blob, {
     contentType,
-    cacheControl: "31536000", // 媒体 ID 即 UUID，内容不会变，可长期缓存
+    // 1 小时：兼顾列表加载速度与「删除后尽快失效」。
+    // 设成一年的话，删掉的照片还能被 CDN 按旧 URL 继续返回很久。
+    cacheControl: "3600",
     upsert,
   });
 
   if (error) throw toAppError(error, "媒体上传失败");
 
-  const { data } = supabase.storage.from(BUCKET).getPublicUrl(path);
-  return { path, url: data?.publicUrl ?? "" };
+  // url 列仍写入（兼容旧版与备份），但读取时以 storage_path 为准。
+  return { path, url: getStoragePublicURL(path) };
 }
 
 /** 桶内路径：关系目录 / 媒体 id.扩展名 */

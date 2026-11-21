@@ -80,53 +80,83 @@ function formatBytes(bytes) {
 
 /**
  * 时间线（已由 repository 排好序）。
- * 异步渲染媒体，返回 { element, dispose }；dispose 会释放本轮所有 objectURL，
+ *
+ * 文字与媒体解耦：本函数同步渲染全部文字，媒体只留空槽位；
+ * 调用方把 element 挂上页面后，再调用 view.loadMedia() 在后台加载。
+ * 媒体失败只把对应槽位降级成可重试的占位块，绝不影响文字。
+ *
+ * dispose 会释放本轮所有 objectURL 并移除媒体失败提示，
  * 调用方在切换视图 / 重新渲染前必须调用它。
  */
-export async function renderTimeline(entries, handlers = {}) {
+export function renderTimeline(entries, handlers = {}) {
   const urls = [];
+  let disposed = false;
+
   const dispose = () => {
+    disposed = true;
     for (const url of urls) revokeMediaURL(url);
     urls.length = 0;
+    hideMediaNotice();
   };
 
-  try {
-    if (!entries.length) {
-      const empty = el("div", "empty-state");
+  if (!entries.length) {
+    const empty = el("div", "empty-state");
 
-      const dog = document.createElement("img");
-      dog.src = "./images/dog-empty.png";
-      dog.alt = "";
-      dog.className = "empty-dog";
+    const dog = document.createElement("img");
+    dog.src = "./images/dog-empty.png";
+    dog.alt = "";
+    dog.className = "empty-dog";
 
-      empty.append(
-        dog,
-        el("h2", "", "还没有记录"),
-        el("p", "", "去记录第一段回忆吧"),
-      );
-      return { element: empty, dispose };
-    }
-
-    const list = el("ul", "timeline");
-    for (const entry of entries) {
-      const card = renderCard(entry);
-      const media = await renderMedia(entry, urls);
-      if (media) card.append(media);
-      if (handlers.onEdit || handlers.onDelete) {
-        card.append(renderEntryActions(entry, handlers));
-      }
-      list.append(card);
-    }
-
-    // 列表结束的小狗标记放在时间线下方，不占用卡片之间的 32px 间距
-    const wrap = el("div", "timeline-wrap");
-    wrap.append(list, renderTimelineEnd());
-
-    return { element: wrap, dispose };
-  } catch (err) {
-    dispose();
-    throw err;
+    empty.append(
+      dog,
+      el("h2", "", "还没有记录"),
+      el("p", "", "去记录第一段回忆吧"),
+    );
+    return { element: empty, dispose, loadMedia: async () => {} };
   }
+
+  const list = el("ul", "timeline");
+  const slots = [];
+
+  for (const entry of entries) {
+    const card = renderCard(entry);
+
+    const ids = Array.isArray(entry.mediaIds) ? entry.mediaIds : [];
+    if (ids.length) {
+      // 只占位，不在这里等媒体：文字必须先上屏
+      const slot = el("div", "media-slot");
+      card.append(slot);
+      slots.push({ entry, slot });
+    }
+
+    if (handlers.onEdit || handlers.onDelete) {
+      card.append(renderEntryActions(entry, handlers));
+    }
+    list.append(card);
+  }
+
+  // 列表结束的小狗标记放在时间线下方，不占用卡片之间的 32px 间距
+  const wrap = el("div", "timeline-wrap");
+  wrap.append(list, renderTimelineEnd());
+
+  const loadSlot = ({ entry, slot }) =>
+    fillMediaSlot({
+      entry,
+      slot,
+      urls,
+      interactive: true,
+      isDisposed: () => disposed,
+      onFailure: showMediaNotice,
+    });
+
+  return {
+    element: wrap,
+    dispose,
+    /** 后台加载所有卡片的媒体；单个失败不会 reject。 */
+    loadMedia: async () => {
+      await Promise.allSettled(slots.map(loadSlot));
+    },
+  };
 }
 
 function renderCard(entry) {
@@ -184,28 +214,85 @@ function renderEntryActions(entry, handlers) {
 }
 
 /**
- * 渲染一条记录的媒体区块，生成的 objectURL 收集进 urls，
- * 由 renderTimeline 的 dispose 统一释放。
- * interactive = false 时（如随机回顾预览）不挂灯箱点击。
+ * 填充一条记录的媒体槽位。
+ *
+ * 任何失败都只影响这个槽位：降级成可点击重试的占位块，并触发顶部轻提示。
+ * interactive = false 时（如随机回顾预览）不挂灯箱点击，也不自动重试。
  */
-async function renderMedia(entry, urls, { interactive = true } = {}) {
+async function fillMediaSlot({
+  entry,
+  slot,
+  urls,
+  interactive = true,
+  isDisposed = () => false,
+  onFailure = null,
+}) {
+  if (isDisposed() || slot.dataset.loading === "true") return;
+  slot.dataset.loading = "true";
+
   const ids = Array.isArray(entry.mediaIds) ? entry.mediaIds : [];
-  if (!ids.length) return null;
+  if (!ids.length) {
+    slot.remove();
+    return;
+  }
+
+  const retry = () => {
+    // 正在加载时不重复发起（失败后 loading 已复位为 false，可以重试）
+    if (isDisposed() || slot.dataset.loading === "true") return;
+    fillMediaSlot({ entry, slot, urls, interactive, isDisposed, onFailure });
+  };
 
   let views;
   try {
     views = await getMediaURLs(ids);
   } catch (err) {
     console.warn("读取媒体失败", entry.id, err);
-    return null;
-  }
-  if (!views.length) return null;
+    slot.dataset.loading = "false";
+    if (isDisposed()) return;
 
-  const block = el("div", "media-block");
+    renderSlotFallback(slot, "照片 / 视频加载失败\n点击重试", retry);
+    onFailure?.();
+    return;
+  }
+
+  if (isDisposed()) {
+    // 视图已切走：把刚拿到的地址立刻释放，不再碰 DOM
+    for (const view of views) revokeMediaURL(view.url);
+    return;
+  }
+
+  slot.replaceChildren();
+  const block = buildMediaBlock({ entry, views, urls, interactive, retry, onFailure });
+
+  if (!block) {
+    slot.dataset.loading = "false";
+    renderSlotFallback(slot, "照片 / 视频加载失败\n点击重试", retry);
+    onFailure?.();
+    return;
+  }
+
+  slot.append(block);
+  slot.dataset.loading = "false";
+
+  // 行还在但个别媒体已被删除 / 缺失：保留能显示的，其余给一个重试入口
+  const missing = ids.length - views.length;
+  if (missing > 0) {
+    block.append(
+      renderMediaFallbackButton(`还有 ${missing} 个媒体未加载\n点击重试`, retry),
+    );
+    onFailure?.();
+  }
+}
+
+/** 把媒体视图组装成区块，并把要释放的地址交给调用方统一管理。 */
+function buildMediaBlock({ entry, views, urls, interactive, retry, onFailure }) {
   const images = views.filter((view) => view.kind === "image");
   const videos = views.filter((view) => view.kind === "video");
+  if (!images.length && !videos.length) return null;
 
+  const block = el("div", "media-block");
   const shownImages = images.slice(0, MAX_IMAGE_THUMBS);
+
   for (const image of shownImages) urls.push(image.url);
   for (const video of videos) urls.push(video.url);
 
@@ -218,17 +305,51 @@ async function renderMedia(entry, urls, { interactive = true } = {}) {
 
   if (shownImages.length) {
     block.append(
-      renderImageGrid(shownImages, imageItems, entry.title, interactive),
+      renderImageGrid(shownImages, imageItems, entry.title, interactive, {
+        retry,
+        onFailure,
+      }),
     );
   }
   for (const video of videos) {
-    block.append(renderVideo(video, entry.title, interactive));
+    block.append(
+      renderVideo(video, entry.title, interactive, { retry, onFailure }),
+    );
   }
 
   return block;
 }
 
-function renderImageGrid(images, items, title, interactive = true) {
+/** 整个槽位加载失败时的可重试占位块。 */
+function renderSlotFallback(slot, message, retry) {
+  slot.replaceChildren(renderMediaFallbackButton(message, retry));
+}
+
+/** 与毛玻璃卡片协调的虚线占位按钮；样式内联，避免改动 styles.css。 */
+function renderMediaFallbackButton(message, retry) {
+  const btn = el("button", "media-fallback", message);
+  btn.type = "button";
+  btn.style.cssText =
+    "display:flex;align-items:center;justify-content:center;width:100%;" +
+    "min-height:96px;padding:16px;border:1px dashed rgba(255,182,193,.9);" +
+    "border-radius:12px;background:rgba(255,255,255,.6);color:#9A8A90;" +
+    "font:inherit;font-size:14px;line-height:1.6;text-align:center;" +
+    "white-space:pre-line;cursor:pointer;";
+  btn.addEventListener("click", () => retry?.());
+  return btn;
+}
+
+/** 单张图片失败时的占位文案。 */
+function renderImageFallbackText(message) {
+  const span = el("span", "media-fallback-text", message);
+  span.style.cssText =
+    "display:flex;align-items:center;justify-content:center;width:100%;" +
+    "height:100%;padding:8px;color:#9A8A90;font-size:13px;" +
+    "line-height:1.5;text-align:center;white-space:pre-line;";
+  return span;
+}
+
+function renderImageGrid(images, items, title, interactive = true, { retry, onFailure } = {}) {
   const grid = el("div", "media-grid");
 
   images.forEach((image, index) => {
@@ -240,6 +361,11 @@ function renderImageGrid(images, items, title, interactive = true) {
       thumb.type = "button";
       thumb.setAttribute("aria-label", `查看第 ${index + 1} 张照片`);
       thumb.addEventListener("click", () => {
+        // 这张图之前加载失败过：点击改为重试，而不是打开灯箱
+        if (thumb.dataset.loadingFailed === "true") {
+          retry?.();
+          return;
+        }
         openLightbox({ items, startIndex: index });
       });
     }
@@ -248,6 +374,17 @@ function renderImageGrid(images, items, title, interactive = true) {
     img.src = image.url;
     img.alt = title ? `${title} 的照片` : "照片";
     img.loading = "lazy";
+    img.addEventListener(
+      "error",
+      () => {
+        if (!thumb.isConnected) return;
+        thumb.dataset.loadingFailed = "true";
+        thumb.style.cursor = interactive ? "pointer" : "default";
+        thumb.replaceChildren(renderImageFallbackText("图片加载失败\n点击重试"));
+        onFailure?.();
+      },
+      { once: true },
+    );
     thumb.append(img);
 
     grid.append(thumb);
@@ -273,7 +410,7 @@ function renderImageGrid(images, items, title, interactive = true) {
   return grid;
 }
 
-function renderVideo(media, title, interactive = true) {
+function renderVideo(media, title, interactive = true, { retry, onFailure } = {}) {
   const wrap = el("div", "media-video");
   const video = document.createElement("video");
   video.src = media.url;
@@ -282,6 +419,19 @@ function renderVideo(media, title, interactive = true) {
   video.playsInline = true;
   video.title = interactive ? "点击画面放大" : "";
   video.setAttribute("aria-label", title ? `${title} 的视频` : "视频");
+
+  // 视频本身加载失败：整块降级成可重试占位，文字不受影响
+  video.addEventListener(
+    "error",
+    () => {
+      if (!wrap.isConnected) return;
+      wrap.replaceChildren(
+        renderMediaFallbackButton("视频加载失败\n点击重试", retry),
+      );
+      onFailure?.();
+    },
+    { once: true },
+  );
 
   if (interactive) {
     video.addEventListener("click", (event) => {
@@ -329,6 +479,46 @@ function renderVideo(media, title, interactive = true) {
 
   wrap.append(video);
   return wrap;
+}
+
+// ---------- 媒体失败轻提示 ----------
+
+let mediaNotice = null;
+
+/** 顶部可关闭的轻提示：媒体加载失败时使用，绝不顶替整页内容。 */
+function showMediaNotice() {
+  if (mediaNotice) return;
+
+  const bar = el("div", "media-notice");
+  bar.setAttribute("role", "status");
+  bar.style.cssText =
+    "position:fixed;top:calc(12px + env(safe-area-inset-top, 0px));" +
+    "left:50%;transform:translateX(-50%);z-index:1050;" +
+    "width:calc(100% - 32px);max-width:640px;display:flex;align-items:center;" +
+    "gap:12px;padding:10px 14px;border-radius:999px;" +
+    "background:rgba(255,255,255,.9);border:1px solid rgba(255,182,193,.7);" +
+    "box-shadow:0 4px 20px rgba(255,182,193,.2);color:#9A8A90;" +
+    "font-size:14px;line-height:1.5;";
+
+  const text = el("span", "", "部分照片 / 视频加载失败，点击占位块可重试");
+  text.style.cssText = "flex:1;";
+
+  const close = el("button", "", "×");
+  close.type = "button";
+  close.setAttribute("aria-label", "关闭提示");
+  close.style.cssText =
+    "margin-left:auto;padding:0 4px;border:0;background:transparent;" +
+    "color:#FF8C9E;font:inherit;font-size:20px;line-height:1;cursor:pointer;";
+  close.addEventListener("click", hideMediaNotice);
+
+  bar.append(text, close);
+  document.body.append(bar);
+  mediaNotice = bar;
+}
+
+function hideMediaNotice() {
+  mediaNotice?.remove();
+  mediaNotice = null;
 }
 
 /**
@@ -694,6 +884,11 @@ export function openEntryPreview(entry) {
 
   const scroll = el("div", "entry-modal-scroll");
   const card = renderCard(entry);
+
+  // 文字先渲染，媒体稍后填入同一个槽位
+  const mediaSlot = el("div", "media-slot");
+  card.append(mediaSlot);
+
   scroll.append(card);
   overlay.append(closeBtn, scroll);
 
@@ -758,19 +953,17 @@ export function openEntryPreview(entry) {
   closeBtn.focus();
 
   // 与时间线一致：图片 / 视频可点开灯箱，灯箱使用自己的 objectURL
-  renderMedia(entry, urls)
-    .then((media) => {
-      if (closed) {
-        // 关闭期间才加载完，立即释放这之后创建的 URL
-        revokeAll();
-        return;
-      }
-      if (media) card.append(media);
-    })
-    .catch((err) => {
-      console.warn("回顾媒体加载失败", err);
-      revokeAll();
-    });
+  fillMediaSlot({
+    entry,
+    slot: mediaSlot,
+    urls,
+    interactive: true,
+    isDisposed: () => closed,
+    onFailure: showMediaNotice,
+  }).catch((err) => {
+    console.warn("回顾媒体加载失败", err);
+    revokeAll();
+  });
 }
 
 /**
@@ -949,6 +1142,205 @@ export function renderSettingsView({
 
   titleInput.focus();
   return form;
+}
+
+// ---------- 悄悄话小纸条 ----------
+
+const NOTE_MAX_LENGTH = 200;
+
+/** 纸条时间：同一年只显示「M月D日 HH:mm」。 */
+function formatNoteTime(timestamp) {
+  const date = new Date(Number(timestamp) || Date.now());
+  const now = new Date();
+  const pad = (n) => String(n).padStart(2, "0");
+  const time = `${pad(date.getHours())}:${pad(date.getMinutes())}`;
+
+  if (date.getFullYear() !== now.getFullYear()) {
+    return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${time}`;
+  }
+  return `${date.getMonth() + 1}月${date.getDate()}日 ${time}`;
+}
+
+/**
+ * 悄悄话小纸条留言板。
+ *
+ * 视图只负责渲染与交互，读写全部交给调用方（app.js → data/notesRepository.js）。
+ * 发送成功后把新纸条插到列表顶部，不整页重绘，避免输入框失焦。
+ *
+ * @param {{
+ *   notes?: object[],
+ *   onSend: (text: string) => Promise<object>,
+ *   onDelete: (note: object) => Promise<boolean>,
+ * }} handlers
+ * @returns {{
+ *   element: HTMLElement,
+ *   setNotes: (notes: object[]) => void,
+ *   setError: (message: string) => void,
+ *   removeNote: (id: string) => void,
+ *   dispose: () => void,
+ * }}
+ */
+export function renderNotesView({ notes = [], onSend, onDelete } = {}) {
+  const root = el("section", "notes-view");
+
+  const head = el("div", "notes-head");
+  const headText = el("div", "notes-head-text");
+  headText.append(
+    el("h2", "notes-title", "悄悄话小纸条"),
+    el("p", "notes-subtitle", "想对 ta 说什么，就写在这里"),
+  );
+  head.append(headText);
+
+  // ---------- 输入区 ----------
+  const composer = el("form", "note-composer");
+
+  const input = document.createElement("textarea");
+  input.rows = 2;
+  input.maxLength = NOTE_MAX_LENGTH;
+  input.placeholder = "写一张小纸条给 ta…";
+  input.setAttribute("aria-label", "小纸条内容");
+
+  const actions = el("div", "note-composer-actions");
+  const hint = el("span", "note-hint", `Enter 发送 · 最多 ${NOTE_MAX_LENGTH} 字`);
+  const sendBtn = el("button", "btn btn-primary", "发送");
+  sendBtn.type = "submit";
+  actions.append(hint, sendBtn);
+
+  const errorEl = el("p", "note-error");
+  errorEl.hidden = true;
+  errorEl.setAttribute("role", "alert");
+
+  composer.append(input, actions, errorEl);
+
+  // ---------- 列表与状态 ----------
+  const statusEl = el("p", "notes-status", "加载中…");
+  const emptyEl = el("div", "notes-empty");
+  emptyEl.append(
+    el("p", "", "还没有小纸条"),
+    el("p", "", "写下第一句悄悄话吧"),
+  );
+  emptyEl.hidden = true;
+
+  const listEl = el("ul", "note-list");
+
+  const setError = (message) => {
+    errorEl.textContent = message ?? "";
+    errorEl.hidden = !message;
+  };
+
+  const updateEmpty = () => {
+    emptyEl.hidden = listEl.children.length > 0;
+  };
+
+  /** 单张纸条卡片；删除成功后自行移出列表。 */
+  const createItem = (note) => {
+    const item = el("li", "note-card");
+    item.dataset.noteId = note.id;
+
+    const content = el("p", "note-content", note.content);
+
+    const foot = el("div", "note-foot");
+    const time = el("time", "note-time", formatNoteTime(note.createdAt));
+    time.dateTime = new Date(Number(note.createdAt) || Date.now()).toISOString();
+
+    const removeBtn = el("button", "note-delete", "删除");
+    removeBtn.type = "button";
+    removeBtn.setAttribute("aria-label", "删除这张小纸条");
+
+    let removing = false;
+    removeBtn.addEventListener("click", async () => {
+      if (removing) return;
+      removing = true;
+      removeBtn.disabled = true;
+      setError("");
+
+      try {
+        const deleted = await onDelete?.(note);
+        if (deleted) {
+          item.remove();
+          updateEmpty();
+        }
+      } catch (err) {
+        console.error(err);
+        setError(err?.message || "删除失败，请重试");
+      } finally {
+        removing = false;
+        if (removeBtn.isConnected) removeBtn.disabled = false;
+      }
+    });
+
+    foot.append(time, removeBtn);
+    item.append(content, foot);
+    return item;
+  };
+
+  const setNotes = (items) => {
+    listEl.replaceChildren(...(items ?? []).map(createItem));
+    statusEl.hidden = true;
+    updateEmpty();
+  };
+
+  const removeNote = (id) => {
+    const item = listEl.querySelector(`[data-note-id="${CSS.escape(String(id))}"]`);
+    item?.remove();
+    updateEmpty();
+  };
+
+  // ---------- 发送 ----------
+  let sending = false;
+
+  composer.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (sending) return;
+
+    setError("");
+    const text = input.value.trim();
+    if (!text) {
+      input.focus();
+      return;
+    }
+
+    sending = true;
+    sendBtn.disabled = true;
+    sendBtn.textContent = "发送中…";
+
+    try {
+      const note = await onSend(text);
+      if (!note) throw new Error("发送失败，请重试");
+
+      input.value = "";
+      listEl.prepend(createItem(note));
+      updateEmpty();
+      input.focus();
+    } catch (err) {
+      console.error(err);
+      setError(err?.message || "发送失败，请重试");
+    } finally {
+      sending = false;
+      sendBtn.disabled = false;
+      sendBtn.textContent = "发送";
+    }
+  });
+
+  // Enter 发送，Shift + Enter 换行
+  input.addEventListener("keydown", (event) => {
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      composer.requestSubmit();
+    }
+  });
+
+  root.append(head, composer, statusEl, emptyEl, listEl);
+
+  if (notes?.length) setNotes(notes);
+
+  return {
+    element: root,
+    setNotes,
+    setError,
+    removeNote,
+    dispose: () => {},
+  };
 }
 
 // ---------- 动效与提示 ----------

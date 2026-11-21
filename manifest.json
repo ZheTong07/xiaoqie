@@ -1,7 +1,7 @@
 {
   "name": "企鹅小窝",
   "short_name": "企鹅小窝",
-  "description": "给两个人的本地回忆记录小窝",
+  "description": "给两个人的回忆记录小窝",
   "lang": "zh-CN",
   "start_url": "/",
   "scope": "/",

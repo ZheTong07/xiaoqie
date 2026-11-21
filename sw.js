@@ -5,7 +5,7 @@
  * 修改静态资源后，请把 CACHE_NAME 的版本号 +1，否则旧缓存会继续生效。
  */
 
-const CACHE_NAME = "qixiaowo-shell-v3";
+const CACHE_NAME = "qixiaowo-shell-v6";
 
 const ASSETS = [
   // serve 会把 /index.html 重定向到 /index，这里直接缓存根路径的应用外壳
@@ -18,6 +18,7 @@ const ASSETS = [
   "/manifest.json",
   "/lib/supabaseClient.js",
   "/data/repository.js",
+  "/data/notesRepository.js",
   "/data/settingsStore.js",
   "/storage/mediaStore.js",
   "/images/dog-empty.png",
@@ -59,6 +60,10 @@ self.addEventListener("fetch", (event) => {
 
   const url = new URL(request.url);
   if (url.origin !== self.location.origin) return;
+
+  // /api/* 是云端数据与媒体的同源反代，绝不进应用外壳缓存：
+  // 缓存会让记录过期，也会让视频的 Range 请求命中整段缓存而无法拖动进度。
+  if (url.pathname === "/api" || url.pathname.startsWith("/api/")) return;
 
   // 页面导航：优先网络，断网时回退到缓存的应用外壳
   if (request.mode === "navigate") {

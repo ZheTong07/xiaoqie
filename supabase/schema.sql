@@ -128,10 +128,37 @@ create policy "xiaoqie media anon delete" on storage.objects
   using (bucket_id = 'media');
 
 -- ============================================================
--- 5. 自检：执行完下面这条，确认列名与前端映射一致
---    （前端映射见 data/repository.js 的 toRow / fromRow）
+-- 5. 悄悄话小纸条（notes）
+-- ============================================================
+
+create table if not exists public.notes (
+  id              uuid primary key,
+  relationship_id text not null default 'cloud-rel-1',
+  content         text not null,
+  created_at      bigint not null
+);
+
+alter table public.notes add column if not exists relationship_id text not null default 'cloud-rel-1';
+alter table public.notes add column if not exists content         text not null default '';
+alter table public.notes add column if not exists created_at      bigint not null default 0;
+
+create index if not exists notes_relationship_created_idx
+  on public.notes (relationship_id, created_at desc);
+
+grant select, insert, update, delete on public.notes to anon, authenticated;
+
+alter table public.notes enable row level security;
+
+drop policy if exists "xiaoqie v1 anon all" on public.notes;
+create policy "xiaoqie v1 anon all" on public.notes
+  for all to anon, authenticated
+  using (true) with check (true);
+
+-- ============================================================
+-- 6. 自检：执行完下面这条，确认列名与前端映射一致
+--    （前端映射见 data/repository.js、data/notesRepository.js 的 toRow / fromRow）
 -- ============================================================
 select table_name, column_name, data_type
 from information_schema.columns
-where table_schema = 'public' and table_name in ('entries', 'media')
+where table_schema = 'public' and table_name in ('entries', 'media', 'notes')
 order by table_name, ordinal_position;
